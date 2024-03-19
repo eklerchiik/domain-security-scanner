@@ -110,140 +110,166 @@ func New(logger zerolog.Logger, timeout time.Duration, opts ...Option) (*Scanner
 
 // Scan scans a list of domains and returns the results.
 func (s *Scanner) Scan(domains ...string) ([]*Result, error) {
-	if s.pool == nil {
-		return nil, errors.New("scanner is closed")
-	}
+    if s.pool == nil {
+        return nil, errors.New("scanner is closed")
+    }
 
-	for _, domain := range domains {
-		if domain == "" {
-			return nil, errors.New("empty domain")
-		}
-	}
+    for _, domain := range domains {
+        if domain == "" {
+            return nil, errors.New("empty domain")
+        }
+    }
 
-	if len(domains) == 0 {
-		return nil, errors.New("no domains to scan")
-	}
+    if len(domains) == 0 {
+        return nil, errors.New("no domains to scan")
+    }
 
-	var mutex sync.Mutex
-	var results []*Result
-	var wg sync.WaitGroup
+    var rwMutex sync.RWMutex
+    var results []*Result
+    var wg sync.WaitGroup
 
-	for _, domainToScan := range domains {
-		wg.Add(1)
+    for _, domainToScan := range domains {
+        wg.Add(1)
 
-		if err := s.pool.Submit(func() {
-			defer func() {
-				wg.Done()
-			}()
+        if err := s.pool.Submit(func() {
+            defer wg.Done()
 
-			var err error
-			result := &Result{
-				Domain: domainToScan,
-			}
+            var err error
+            result := &Result{
+                Domain: domainToScan,
+            }
 
-			if s.cache != nil {
-				scanResult := s.cache.Get(domainToScan)
-				if scanResult != nil {
-					s.logger.Debug().Msg("cache hit for " + domainToScan)
-					mutex.Lock()
-					results = append(results, scanResult)
-					mutex.Unlock()
-					return
-				}
+            if s.cache != nil {
+                rwMutex.RLock()
+                scanResult := s.cache.Get(domainToScan)
+                rwMutex.RUnlock()
+                if scanResult != nil {
+                    s.logger.Debug().Msg("cache hit for " + domainToScan)
+                    rwMutex.Lock()
+                    results = append(results, scanResult)
+                    rwMutex.Unlock()
+                    return
+                }
 
-				s.logger.Debug().Msg("cache miss for " + domainToScan)
+                s.logger.Debug().Msg("cache miss for " + domainToScan)
 
-				defer func() {
-					s.cache.Set(domainToScan, result)
-				}()
-			}
+                defer func() {
+                    rwMutex.Lock()
+                    s.cache.Set(domainToScan, result)
+                    rwMutex.Unlock()
+                }()
+            }
 
-			// check that the domain name is valid
-			result.NS, err = s.getDNSRecords(domainToScan, dns.TypeNS)
-			if err != nil || len(result.NS) == 0 {
-				// check if TXT records exist, as the nameserver check won't work for subdomains
-				records, err := s.getDNSAnswers(domainToScan, dns.TypeTXT)
-				if err != nil || len(records) == 0 {
-					// fill variable to satisfy deferred cache fill
-					result = &Result{
-						Domain: domainToScan,
-						Error:  "invalid domain name",
-					}
+            // check that the domain name is valid
+            result.NS, err = s.getDNSRecords(domainToScan, dns.TypeNS)
+            if err != nil || len(result.NS) == 0 {
+                // check if TXT records exist, as the nameserver check won't work for subdomains
+                records, err := s.getDNSAnswers(domainToScan, dns.TypeTXT)
+                if err != nil || len(records) == 0 {
+                    // fill variable to satisfy deferred cache fill
+                    result = &Result{
+                        Domain: domainToScan,
+                        Error:  "invalid domain name",
+                    }
 
-					mutex.Lock()
-					results = append(results, result)
-					mutex.Unlock()
+                    rwMutex.Lock()
+                    results = append(results, result)
+                    rwMutex.Unlock()
+                    return
+                }
+            }
 
-					return
-				}
-			}
+            var errs []string
+            scanWg := sync.WaitGroup{}
+            scanWg.Add(5)
 
-			var errs []string
-			scanWg := sync.WaitGroup{}
-			scanWg.Add(5)
+            // Get BIMI record
+            go func() {
+                defer scanWg.Done()
+                bimi, err := s.getTypeBIMI(domainToScan)
+                if err != nil {
+                    errs = append(errs, "bimi:"+err.Error())
+                    return
+                }
+                rwMutex.Lock()
+                result.BIMI = bimi
+                results = append(results, result)
+                rwMutex.Unlock()
+            }()
 
-			// Get BIMI record
-			go func() {
-				defer scanWg.Done()
-				result.BIMI, err = s.getTypeBIMI(domainToScan)
-				if err != nil {
-					errs = append(errs, "bimi:"+err.Error())
-				}
-			}()
+            // Get DKIM record
+            go func() {
+                defer scanWg.Done()
+                dkim, err := s.getTypeDKIM(domainToScan)
+                if err != nil {
+                    errs = append(errs, "dkim:"+err.Error())
+                    return
+                }
+                rwMutex.Lock()
+                result.DKIM = dkim
+                results = append(results, result)
+                rwMutex.Unlock()
+            }()
 
-			// Get DKIM record
-			go func() {
-				defer scanWg.Done()
-				result.DKIM, err = s.getTypeDKIM(domainToScan)
-				if err != nil {
-					errs = append(errs, "dkim:"+err.Error())
-				}
-			}()
+            // Get DMARC record
+            go func() {
+                defer scanWg.Done()
+                dmarc, err := s.getTypeDMARC(domainToScan)
+                if err != nil {
+                    errs = append(errs, "dmarc:"+err.Error())
+                    return
+                }
+                rwMutex.Lock()
+                result.DMARC = dmarc
+                results = append(results, result)
+                rwMutex.Unlock()
+            }()
 
-			// Get DMARC record
-			go func() {
-				defer scanWg.Done()
-				result.DMARC, err = s.getTypeDMARC(domainToScan)
-				if err != nil {
-					errs = append(errs, "dmarc:"+err.Error())
-				}
-			}()
+            // Get MX records
+            go func() {
+                defer scanWg.Done()
+                mx, err := s.getDNSRecords(domainToScan, dns.TypeMX)
+                if err != nil {
+                    errs = append(errs, "mx:"+err.Error())
+                    return
+                }
+                rwMutex.Lock()
+                result.MX = mx
+                results = append(results, result)
+                rwMutex.Unlock()
+            }()
 
-			// Get MX records
-			go func() {
-				defer scanWg.Done()
-				result.MX, err = s.getDNSRecords(domainToScan, dns.TypeMX)
-				if err != nil {
-					errs = append(errs, "mx:"+err.Error())
-				}
-			}()
+            // Get SPF record
+            go func() {
+                defer scanWg.Done()
+                spf, err := s.getTypeSPF(domainToScan)
+                if err != nil {
+                    errs = append(errs, "spf:"+err.Error())
+                    return
+                }
+                rwMutex.Lock()
+                result.SPF = spf
+                results = append(results, result)
+                rwMutex.Unlock()
+            }()
 
-			// Get SPF record
-			go func() {
-				defer scanWg.Done()
-				result.SPF, err = s.getTypeSPF(domainToScan)
-				if err != nil {
-					errs = append(errs, "spf:"+err.Error())
-				}
-			}()
+            scanWg.Wait()
 
-			scanWg.Wait()
+            if len(errs) > 0 {
+                result.Error = strings.Join(errs, ", ")
+            }
 
-			if len(errs) > 0 {
-				result.Error = strings.Join(errs, ", ")
-			}
+            rwMutex.Lock()
+            results = append(results, result)
+            rwMutex.Unlock()
+        }); err != nil {
+            return nil, err
+        }
+    }
 
-			mutex.Lock()
-			results = append(results, result)
-			mutex.Unlock()
-		}); err != nil {
-			return nil, err
-		}
-	}
+    wg.Wait()
 
-	wg.Wait()
-
-	return results, nil
+    return results, nil
 }
 
 func (s *Scanner) ScanZone(zone io.Reader) ([]*Result, error) {
